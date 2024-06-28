@@ -72,6 +72,51 @@ impl<'a, P: KeyTrait + 'a, V: Clone> Iterator for Iter<'a, P, V> {
     }
 }
 
+pub struct IterWithCallback<'a, P: KeyTrait + 'a, V: Clone>
+{
+    inner: Box<dyn Iterator<Item = (Vec<u8>, &'a V, &'a u64, &'a u64)> + 'a>,
+    _marker: std::marker::PhantomData<P>,
+    func: Option<Box<dyn FnMut(Vec<u8>, &V, &u64, &u64)>>, // Store the function
+}
+
+impl<'a, P: KeyTrait + 'a, V: Clone> IterWithCallback<'a, P, V>
+{
+    /// Creates a new Iter instance.
+    pub fn new(node: Option<&'a Arc<Node<P, V>>>) -> Self {
+        match node {
+            Some(node) => Self {
+                inner: Box::new(IterState::new(node, false)),
+                _marker: Default::default(),
+                func: None, // Initialize the function as None
+            },
+            None => Self {
+                inner: Box::new(std::iter::empty()),
+                _marker: Default::default(),
+                func: None, // Initialize the function as None
+            },
+        }
+    }
+
+    /// Sets the function to be used in next_up.
+    pub fn set_func(&mut self, func: Box<dyn FnMut(Vec<u8>, &V, &u64, &u64)>) {
+        self.func = Some(func);
+    }
+
+    pub fn next_up(&mut self) -> Option<()> {
+        if let Some(ref mut func) = self.func {
+            if let Some((key, value, version, ts)) = self.inner.next() {
+                func(key, value, version, ts);
+                Some(())
+            } else {
+                None
+            }
+        } else {
+            None // Or handle the case where func is not set
+        }
+    }
+}
+
+
 /// An internal state for the Iter iterator.
 struct IterState<'a, P: KeyTrait + 'a, V: Clone> {
     iters: Vec<NodeIter<'a, P, V>>,

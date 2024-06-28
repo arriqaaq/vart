@@ -3,7 +3,7 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::art::{Node, Tree};
-use crate::iter::{Iter, Range, VersionedIter};
+use crate::iter::{IterWithCallback, Iter, Range, VersionedIter};
 use crate::node::Version;
 use crate::{KeyTrait, TrieError};
 
@@ -136,6 +136,14 @@ impl<P: KeyTrait, V: Clone> Snapshot<P, V> {
     {
         Range::new_versioned(self.root.as_ref(), range)
     }
+
+    pub fn iter_callback(&self, func: Box<dyn FnMut(Vec<u8>, &V, &u64, &u64)>) -> IterWithCallback<P, V> 
+    {
+        let mut iter = IterWithCallback::new(self.root.as_ref());
+        iter.set_func(func);
+        iter
+    }
+
 }
 
 #[cfg(test)]
