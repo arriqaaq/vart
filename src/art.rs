@@ -4,8 +4,7 @@ use std::cmp::Ordering;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use crate::iter::IterItem;
-use crate::iter::{scan_node, Iter, Range};
+use crate::iter::{query_keys_at_node, scan_node, Iter, Range};
 use crate::node::{FlatNode, LeafValue, Node256, Node48, NodeTrait, TwigNode};
 use crate::{KeyTrait, TrieError};
 
@@ -691,7 +690,7 @@ impl<P: KeyTrait, V: Clone> Node<P, V> {
     }
 
     #[inline]
-    pub(crate) fn get_leaf_by_query(&self, query_type: QueryType) -> Option<&Arc<LeafValue<V>>> {
+    pub(crate) fn get_leaf_by_query(&self, query_type: QueryType) -> Option<Arc<LeafValue<V>>> {
         let twig = if let NodeType::Twig(twig) = &self.node_type {
             // For a Twig node simply use its inner value.
             twig
@@ -1590,7 +1589,10 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
     /// Returns a `Range` iterator instance that iterates over the key-value pairs within the given range.
     /// If the Trie is empty, an empty `Range` iterator is returned.
     ///
-    pub fn range<'a, R>(&'a self, range: R) -> impl Iterator<Item = IterItem<'a, V>>
+    pub fn range<'a, R>(
+        &'a self,
+        range: R,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, &'a u64, &'a u64)>
     where
         R: RangeBounds<P> + 'a,
     {
@@ -1616,7 +1618,10 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
     /// # Returns
     ///
     /// Returns an iterator over the key-value pairs, versions, and timestamps within the specified range.
-    pub fn range_with_versions<'a, R>(&'a self, range: R) -> impl Iterator<Item = IterItem<'a, V>>
+    pub fn range_with_versions<'a, R>(
+        &'a self,
+        range: R,
+    ) -> impl Iterator<Item = (Vec<u8>, &'a V, &'a u64, &'a u64)>
     where
         R: RangeBounds<P> + 'a,
     {
@@ -1708,15 +1713,18 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
         self.size == 0
     }
 
-    pub fn scan_at_ts<'a, R>(
-        &'a self,
-        range: R,
-        ts: u64,
-    ) -> impl Iterator<Item = IterItem<'a, V>> + 'a
+    pub fn scan_at_ts<R>(&self, range: R, ts: u64) -> Vec<(Vec<u8>, V)>
     where
-        R: RangeBounds<P> + 'a,
+        R: RangeBounds<P>,
     {
         scan_node(self.root.as_ref(), range, QueryType::LatestByTs(ts))
+    }
+
+    pub fn keys_at_ts<R>(&self, range: R, ts: u64) -> Vec<Vec<u8>>
+    where
+        R: RangeBounds<P>,
+    {
+        query_keys_at_node(self.root.as_ref(), range, QueryType::LatestByTs(ts))
     }
 
     /// Retrieves the maximum version inside the Trie.
@@ -1725,7 +1733,7 @@ impl<P: KeyTrait, V: Clone> Tree<P, V> {
     /// all the nodes. This version could be lesser than the current incremental version.
     pub fn max_version_in_trie(&self) -> u64 {
         self.iter()
-            .map(|(_, _, version, _)| version)
+            .map(|(_, _, version, _)| *version)
             .max()
             .unwrap_or(0)
     }
@@ -2411,10 +2419,10 @@ mod tests {
 
         let tree_iter = tree.iter();
         for tree_entry in tree_iter {
-            let k = from_be_bytes_key(tree_entry.0);
+            let k = from_be_bytes_key(&tree_entry.0);
             assert_eq!(expected as u64, k);
             let ts = tree_entry.3;
-            assert_eq!(expected as u64, ts);
+            assert_eq!(expected as u64, *ts);
             expected = expected.wrapping_add(1);
             len += 1;
         }
@@ -2439,7 +2447,7 @@ mod tests {
 
         let tree_iter = tree.iter();
         for tree_entry in tree_iter {
-            let k = from_be_bytes_key(tree_entry.0);
+            let k = from_be_bytes_key(&tree_entry.0);
             assert_eq!(expected as u64, k);
             expected = expected.wrapping_add(1);
             len += 1;
@@ -2861,7 +2869,7 @@ mod tests {
         let mut iter = tree.iter();
         let (_, value, version, _) = iter.next().unwrap();
         assert_eq!(value, &2);
-        assert_eq!(version, 2);
+        assert_eq!(version, &2);
 
         // Verify get at version 0 gives the latest version
         let (value, version, _) = tree.get(&key, 0).unwrap();
@@ -2925,7 +2933,7 @@ mod tests {
 
         // Assert that results are in expected order
         for (i, result) in results.iter().enumerate() {
-            let result_str = std::str::from_utf8(result.0).expect("Invalid UTF-8");
+            let result_str = std::str::from_utf8(result.0.as_slice()).expect("Invalid UTF-8");
             assert_eq!(result_str, expected_order[i]);
         }
     }
@@ -3011,7 +3019,7 @@ mod tests {
         let mut count = 0;
         let tree_iter = tree.iter();
         for (key, value, version, ts) in tree_iter {
-            assert!(inserted_data.contains(&(key.to_vec(), *value, version, ts)));
+            assert!(inserted_data.contains(&(key, *value, *version, *ts)));
             count += 1;
         }
 
@@ -3325,7 +3333,7 @@ mod tests {
     #[test]
     fn scan_empty_range() {
         let tree: Tree<VariableSizeKey, i32> = Tree::new();
-        let result: Vec<_> = tree.scan_at_ts(RangeFull {}, 0).collect();
+        let result = tree.scan_at_ts(RangeFull {}, 0);
         assert!(result.is_empty());
     }
 
@@ -3339,7 +3347,7 @@ mod tests {
         }
         let range = VariableSizeKey::from_slice("key_1".as_bytes())
             ..=VariableSizeKey::from_slice("key_2".as_bytes());
-        let values: Vec<_> = tree.scan_at_ts(range, 0).collect();
+        let values = tree.scan_at_ts(range, 0);
         assert_eq!(values.len(), 2);
     }
 
@@ -3351,7 +3359,7 @@ mod tests {
             tree.insert(&VariableSizeKey::from_str(key).unwrap(), 1, 0, 0)
                 .unwrap();
         }
-        let values: Vec<_> = tree.scan_at_ts(RangeFull {}, 0).collect();
+        let values = tree.scan_at_ts(RangeFull {}, 0);
         assert_eq!(values.len(), keys.len());
     }
 
@@ -3365,7 +3373,7 @@ mod tests {
         }
         let range = VariableSizeKey::from_slice("key_4".as_bytes())
             ..VariableSizeKey::from_slice("key_5".as_bytes());
-        let values: Vec<_> = tree.scan_at_ts(range, 0).collect();
+        let values = tree.scan_at_ts(range, 0);
         assert!(values.is_empty());
     }
 
@@ -3383,7 +3391,7 @@ mod tests {
             .unwrap();
         }
         for (i, _) in keys.iter().enumerate() {
-            let values: Vec<_> = tree.scan_at_ts(RangeFull {}, i as u64).collect();
+            let values = tree.scan_at_ts(RangeFull {}, i as u64);
             assert_eq!(values.len(), i + 1);
         }
     }
@@ -3399,7 +3407,7 @@ mod tests {
                 .unwrap();
         }
 
-        let values: Vec<_> = tree.scan_at_ts(RangeFull {}, num_keys).collect();
+        let values = tree.scan_at_ts(RangeFull {}, num_keys);
         assert_eq!(values.len(), num_keys as usize); // Expect all keys to be visible
     }
 
@@ -3420,15 +3428,15 @@ mod tests {
         }
 
         // Scan at a timestamp before any insertions
-        let result_before: Vec<_> = tree.scan_at_ts(RangeFull {}, 0).collect();
+        let result_before = tree.scan_at_ts(RangeFull {}, 0);
         assert!(result_before.is_empty());
 
         // Scan between insertions
-        let result_mid: Vec<_> = tree.scan_at_ts(RangeFull {}, 4).collect();
+        let result_mid = tree.scan_at_ts(RangeFull {}, 4);
         assert_eq!(result_mid.len(), 2); // Expect first two keys to be visible
 
         // Scan after all insertions
-        let result_after: Vec<_> = tree.scan_at_ts(RangeFull {}, 7).collect();
+        let result_after = tree.scan_at_ts(RangeFull {}, 7);
         assert_eq!(result_after.len(), keys.len()); // Expect all keys to be visible
     }
 
@@ -3439,9 +3447,135 @@ mod tests {
         tree.insert(&VariableSizeKey::from_str("key_1").unwrap(), 42, 0, 0)
             .unwrap();
 
-        let values: Vec<_> = tree.scan_at_ts(RangeFull {}, 0).collect();
+        let values = tree.scan_at_ts(RangeFull {}, 0);
+
         assert_eq!(values.len(), 1);
-        assert_eq!(values[0].1, &42);
+        assert_eq!(values[0].1, 42);
+    }
+
+    #[test]
+    fn keys_at_empty_range() {
+        let tree: Tree<VariableSizeKey, i32> = Tree::new();
+        let keys = tree.keys_at_ts(RangeFull {}, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn keys_at_range_includes_some_keys() {
+        let mut tree: Tree<VariableSizeKey, i32> = Tree::new();
+        let keys_to_insert = ["key_1", "key_2", "key_3"];
+        for key in keys_to_insert.iter() {
+            tree.insert(&VariableSizeKey::from_str(key).unwrap(), 1, 0, 0)
+                .unwrap();
+        }
+        let range = VariableSizeKey::from_slice("key_1".as_bytes())
+            ..=VariableSizeKey::from_slice("key_2".as_bytes());
+        let keys = tree.keys_at_ts(range, 0);
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn keys_at_range_includes_all_keys() {
+        let mut tree: Tree<VariableSizeKey, i32> = Tree::new();
+        let keys_to_insert = ["key_1", "key_2", "key_3"];
+        for key in keys_to_insert.iter() {
+            tree.insert(&VariableSizeKey::from_str(key).unwrap(), 1, 0, 0)
+                .unwrap();
+        }
+        let keys = tree.keys_at_ts(RangeFull {}, 0);
+        assert_eq!(keys.len(), keys_to_insert.len());
+    }
+
+    #[test]
+    fn keys_at_range_includes_no_keys() {
+        let mut tree: Tree<VariableSizeKey, i32> = Tree::new();
+        let keys_to_insert = ["key_1", "key_2", "key_3"];
+        for key in keys_to_insert.iter() {
+            tree.insert(&VariableSizeKey::from_str(key).unwrap(), 1, 0, 0)
+                .unwrap();
+        }
+        let range = VariableSizeKey::from("key_4".as_bytes().to_vec())
+            ..VariableSizeKey::from("key_5".as_bytes().to_vec());
+        let keys = tree.keys_at_ts(range, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn keys_at_different_timestamps() {
+        let mut tree: Tree<VariableSizeKey, i32> = Tree::new();
+        let keys_to_insert = ["key_1", "key_2", "key_3"];
+        for (i, key) in keys_to_insert.iter().enumerate() {
+            tree.insert(
+                &VariableSizeKey::from_str(key).unwrap(),
+                i as i32,
+                0,
+                i as u64,
+            )
+            .unwrap();
+        }
+        for (i, _) in keys_to_insert.iter().enumerate() {
+            let keys = tree.keys_at_ts(RangeFull {}, i as u64);
+            assert_eq!(keys.len(), i + 1);
+        }
+    }
+
+    #[test]
+    fn keys_at_large_number_of_inserts() {
+        let mut tree: Tree<VariableSizeKey, u64> = Tree::new();
+        let num_keys = 10000u64; // Large number of keys
+        let mut expected_keys = Vec::new();
+        for i in 0..num_keys {
+            let key = format!("key_{}", i);
+            expected_keys.push(VariableSizeKey::from_str(&key).unwrap());
+            tree.insert(&VariableSizeKey::from_str(&key).unwrap(), i, 0, i)
+                .unwrap();
+        }
+
+        let keys = tree.keys_at_ts(RangeFull {}, num_keys);
+        assert_eq!(keys.len(), num_keys as usize); // Expect all keys to be visible
+
+        // Sort the expected keys lexicographically
+        expected_keys.sort();
+
+        // Verify each key is proper
+        for (expected_key, key) in expected_keys.iter().zip(keys.iter()) {
+            assert_eq!(key, expected_key.to_slice());
+        }
+    }
+
+    #[test]
+    fn keys_at_various_timestamps() {
+        let mut tree: Tree<VariableSizeKey, i32> = Tree::new();
+        let keys_to_insert = ["key_1", "key_2", "key_3"];
+        for (i, key) in keys_to_insert.iter().enumerate() {
+            let timestamp = ((i + 1) * 2) as u64;
+            tree.insert(
+                &VariableSizeKey::from_str(key).unwrap(),
+                i as i32,
+                0,
+                timestamp,
+            )
+            .unwrap();
+        }
+
+        let keys_before = tree.keys_at_ts(RangeFull {}, 0);
+        assert!(keys_before.is_empty());
+
+        let keys_mid = tree.keys_at_ts(RangeFull {}, 4);
+        assert_eq!(keys_mid.len(), 2); // Expect first two keys to be visible
+
+        let keys_after = tree.keys_at_ts(RangeFull {}, 7);
+        assert_eq!(keys_after.len(), keys_to_insert.len()); // Expect all keys to be visible
+    }
+
+    #[test]
+    fn keys_at_with_single_item_in_snapshot() {
+        let mut tree: Tree<VariableSizeKey, i32> = Tree::new();
+        tree.insert(&VariableSizeKey::from_str("key_1").unwrap(), 42, 0, 0)
+            .unwrap();
+
+        let keys = tree.keys_at_ts(RangeFull {}, 0);
+        assert_eq!(keys.len(), 1);
     }
 
     #[test]
